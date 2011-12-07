@@ -8,6 +8,9 @@
 #include <iostream>
 #include <string>
 #include <fstream>
+#include <vector>
+#include <sstream>
+#include <cstdlib>
 using namespace std;
 #include "cs3516sock.h"
 
@@ -30,6 +33,44 @@ char g_statusStrings[4][32] = {
 	"SENT_OKAY"
 };
 
+typedef enum {
+	GLOBAL_CONFIG = 0,
+	ROUTER_ID,
+	HOST_ID,
+	ROUTER_ROUTER_LINK,
+	ROUTER_HOST_LINK
+} configType;
+
+
+struct router {
+	int id;
+	u_int32_t realIp;
+};
+
+struct endhost {
+	int id;
+	u_int32_t realIp;
+	u_int32_t overlayIp;
+};
+
+struct routerlink {
+	int router1Id;
+	int router2Id;
+	int router1SendDelay;
+	int router2SendDelay;
+};
+
+struct hostlink {
+	int routerId;
+	int routerSendDelay;
+	u_int32_t overlayPrefix;
+	int significantBits;
+	int endHostId;
+	int hostSendDelay;
+};
+
+
+void readConfig();
 void readArgs(int argc, char *argv[]);
 void readOverlayHeaders(u_int8_t *buffer, struct iphdr **iphPointer, struct udphdr **udphPointer, u_int8_t payload[PAYLOAD_LEN]);
 void createPacket(u_int8_t *buffer, u_int32_t destIP, u_int8_t *payload, int payloadLen);
@@ -42,9 +83,17 @@ void logPacket(struct iphdr *overlayIPHdr, logStatusCode code, u_int32_t nextHop
 
 u_int8_t g_TTL = 3;
 u_int32_t g_IP = strIPtoBin("192.168.0.10");
+int g_queueLength = 0;
+int g_defaultTTL = 0;
+vector<router> g_routers;
+vector<endhost> g_endhosts;
+vector<routerlink> g_routerlinks;
+vector<hostlink> g_hostlinks;
+
 
 
 int main(int argc, char *argv[]) {
+	readConfig();
 	readArgs(argc, argv);
 	return 0;
 }
@@ -118,6 +167,68 @@ string binIPtoStr(u_int32_t naddr) {
 	haddr = ntohl(naddr);
 	sprintf(ipAddr, "%d.%d.%d.%d", (haddr&0xFF000000)>>24, (haddr&0xFF0000)>>16, (haddr&0xFF00)>>8, haddr&0xFF);
 	return string(ipAddr);
+}
+
+void readConfig() {
+	fstream configfile;
+	configfile.open("config.txt", fstream::in);
+	if(!configfile.is_open()) {
+		cerr<<"Unable to open config file."<<endl;
+		return;
+	}
+	
+	while(configfile.good()) {
+		char temp[128];
+		configfile.getline(temp, 127);
+		istringstream line(temp);
+		int type;
+		string ip;
+		line >> type;
+		switch(type) {
+			case GLOBAL_CONFIG:
+				line >> g_queueLength;
+				line >> g_defaultTTL;
+				break;
+			case ROUTER_ID:
+				router r;
+				line >> r.id;
+				line >> ip;
+				r.realIp = strIPtoBin(ip.c_str());
+				g_routers.push_back(r);
+				break;
+			case HOST_ID:
+				endhost h;
+				line >> h.id;
+				line >> ip;
+				h.realIp = strIPtoBin(ip.c_str());
+				line >> ip;
+				h.overlayIp = strIPtoBin(ip.c_str());
+				g_endhosts.push_back(h);
+				break;
+			case ROUTER_ROUTER_LINK:
+				routerlink link;
+				line >> link.router1Id;
+				line >> link.router1SendDelay;
+				line >> link.router2Id;
+				line >> link.router2SendDelay;
+				g_routerlinks.push_back(link);
+				break;
+			case ROUTER_HOST_LINK:
+				hostlink hlink;
+				line >> hlink.routerId;
+				line >> hlink.routerSendDelay;
+				string prefix;
+				line >> prefix;
+				size_t slash = prefix.find_first_of("/");
+				hlink.overlayPrefix = strIPtoBin(prefix.substr(0, slash).c_str());
+				hlink.significantBits = atoi(prefix.substr(slash+1).c_str());
+				line >> hlink.endHostId;
+				line >> hlink.hostSendDelay;
+				g_hostlinks.push_back(hlink);
+				break;
+		}
+		
+	}
 }
 
 void beAHost(void) {
