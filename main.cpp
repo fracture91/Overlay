@@ -4,32 +4,62 @@
 #include <netinet/ip.h>
 #include <netinet/udp.h>
 
+#include <ctime>
 #include <iostream>
+#include <string>
+#include <fstream>
 using namespace std;
 #include "cs3516sock.h"
 
 #define PAYLOAD_LEN 1000
 #define PACKET_LEN sizeof(struct iphdr) + sizeof(struct udphdr) + PAYLOAD_LEN
 
+fstream g_logfile;
+
+typedef enum {
+	TTL_EXPIRED = 0,
+	MAX_SENDQ_EXCEEDED,
+	NO_ROUTE_TO_HOST,
+	SENT_OKAY
+} logStatusCode;
+
+char g_statusStrings[4][32] = {
+	"TTL_EXPIRED",
+	"MAX_SENDQ_EXCEEDED",
+	"NO_ROUTE_TO_HOST",
+	"SENT_OKAY"
+};
+
 void readArgs(int argc, char *argv[]);
 void readOverlayHeaders(u_int8_t *buffer, struct iphdr **iphPointer, struct udphdr **udphPointer, u_int8_t payload[PAYLOAD_LEN]);
 void createPacket(u_int8_t *buffer, u_int32_t destIP, u_int8_t *payload, int payloadLen);
 u_int32_t strIPtoBin(const char *strIP);
+string binIPtoStr(u_int32_t naddr);
 void beAHost(void);
 void beARouter(void);
 void printPacket(u_int8_t packet[PACKET_LEN], int length);
+void logPacket(struct iphdr *overlayIPHdr, logStatusCode code, u_int32_t nextHop);
 
 u_int8_t g_TTL = 3;
-u_int32_t g_IP = strIPtoBin("127.0.0.1");
+u_int32_t g_IP = strIPtoBin("192.168.0.10");
 
 
 int main(int argc, char *argv[]) {
-	beAHost();
+	readArgs(argc, argv);
 	return 0;
 }
 
 
-void readArgs(int argc, char *argv[]);
+void readArgs(int argc, char *argv[]) {
+	if(argc > 1) {
+		if(!strcmp(argv[1], "host")) {
+			beAHost();
+		}
+		else if(!strcmp(argv[1], "router")) {
+			beARouter();
+		}
+	}
+}
 
 //read the overlay headers into ip and udp struct, print out info from them
 void readOverlayHeaders(u_int8_t *buffer, struct iphdr **iphPointer, struct udphdr **udphPointer, u_int8_t payload[PAYLOAD_LEN]) {
@@ -81,6 +111,15 @@ u_int32_t strIPtoBin(const char *strIP) {
 	return (octet3&0xFF)<<24 | (octet2&0xFF) << 16 | (octet1&0xFF) << 8 | (octet0&0xFF);
 }
 
+//Get an IP address string from a 32-bit integer from the IP header (assume network byte order)
+string binIPtoStr(u_int32_t naddr) {
+	char ipAddr[16] = "";
+	u_int32_t haddr;
+	haddr = ntohl(naddr);
+	sprintf(ipAddr, "%d.%d.%d.%d", (haddr&0xFF000000)>>24, (haddr&0xFF0000)>>16, (haddr&0xFF00)>>8, haddr&0xFF);
+	return string(ipAddr);
+}
+
 void beAHost(void) {
 	int sock;
 	
@@ -88,16 +127,17 @@ void beAHost(void) {
 	u_int8_t rxPayload[PAYLOAD_LEN] = "";
 	u_int8_t txBuffer[PACKET_LEN];
 	u_int8_t rxBuffer[PACKET_LEN] = "";
-	u_int32_t localhost = strIPtoBin("127.0.0.1");
+	u_int32_t router = strIPtoBin("192.168.0.8");
+	u_int32_t destination = strIPtoBin("192.168.0.10");
 	int payloadLen = strlen((char *)payload);
 	int bytesSent;
 	int bytesReceived;
 	sock = create_cs3516_socket();
 	cout<<"Socket created."<<endl;
 	
-	createPacket(txBuffer, localhost, payload, payloadLen);
+	createPacket(txBuffer, destination, payload, payloadLen);
 	printPacket(txBuffer, 28 + payloadLen);
-	bytesSent = cs3516_send(sock, (char *)txBuffer, 28 + payloadLen, localhost);
+	bytesSent = cs3516_send(sock, (char *)txBuffer, 28 + payloadLen, router);
 	
 	bytesReceived = cs3516_recv(sock, (char *)rxBuffer, PACKET_LEN);
 	struct iphdr *iph;
@@ -109,6 +149,40 @@ void beAHost(void) {
 }
 
 void beARouter(void) {
+	int sock;
+	struct iphdr *iph;
+	struct udphdr *udph;
+	u_int32_t fwdAddr;
+	u_int8_t packetBuffer[PACKET_LEN] = "";
+	u_int8_t payload[PAYLOAD_LEN] = "";
+	int bytesReceived;
+	cout<<"Being a router. Route route!"<<endl;
+	
+	sock = create_cs3516_socket();
+	
+	g_logfile.open("ROUTER_control.txt", fstream::out | fstream::app);
+	if(!g_logfile.is_open()) {
+		cerr<<"Unable to open logfile."<<endl;
+		return;
+	}
+	
+	while(1) {
+		bytesReceived = cs3516_recv(sock, (char *)packetBuffer, PACKET_LEN);
+		readOverlayHeaders(packetBuffer, &iph, &udph, payload);
+		
+		//handle ttl
+		iph->ttl-=1;
+		if(iph->ttl <= 0) {
+			//drop packet
+			logPacket(iph, TTL_EXPIRED, 0);
+			continue;
+		}
+		
+		//forward packet
+		fwdAddr = strIPtoBin("192.168.0.10");
+		cs3516_send(sock, (char *)packetBuffer, bytesReceived, fwdAddr);
+		logPacket(iph, SENT_OKAY, fwdAddr);
+	}
 }
 
 void printPacket(u_int8_t packet[PACKET_LEN], int length) {
@@ -118,4 +192,18 @@ void printPacket(u_int8_t packet[PACKET_LEN], int length) {
 			printf("\n");
 		}
 	}
+}
+
+void logPacket(struct iphdr *overlayIPHdr, logStatusCode code, u_int32_t nextHop) {
+	time_t timeVal = time(NULL);
+	g_logfile<<timeVal<<" "
+		<<binIPtoStr(overlayIPHdr->saddr)<<" " //source address
+		<<binIPtoStr(overlayIPHdr->daddr)<<" " //destination address
+		<<ntohs(overlayIPHdr->id)<<" " //IP_IDENT
+		<<g_statusStrings[code]; //status code
+	if(code == SENT_OKAY) {
+		g_logfile<<" "<<binIPtoStr(nextHop); //next hop
+	}
+	g_logfile<<endl;
+	return;
 }
