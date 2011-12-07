@@ -13,11 +13,18 @@
 #include <cstdlib>
 using namespace std;
 #include "cs3516sock.h"
+#include "trie.h"
+
+//
+// Constants and macros
+//
 
 #define PAYLOAD_LEN 1000
 #define PACKET_LEN sizeof(struct iphdr) + sizeof(struct udphdr) + PAYLOAD_LEN
 
-fstream g_logfile;
+//
+// Types
+//
 
 typedef enum {
 	TTL_EXPIRED = 0,
@@ -69,6 +76,9 @@ struct hostlink {
 	int hostSendDelay;
 };
 
+//
+// Function declarations
+//
 
 void readConfig();
 void readArgs(int argc, char *argv[]);
@@ -81,16 +91,25 @@ void beARouter(void);
 void printPacket(u_int8_t packet[PACKET_LEN], int length);
 void logPacket(struct iphdr *overlayIPHdr, logStatusCode code, u_int32_t nextHop);
 
+//
+// Globals
+//
+
+fstream g_logfile;
 u_int8_t g_TTL = 3;
 u_int32_t g_IP = strIPtoBin("192.168.0.10");
 int g_queueLength = 0;
 int g_defaultTTL = 0;
+int g_thisID = 0;
 vector<router> g_routers;
 vector<endhost> g_endhosts;
 vector<routerlink> g_routerlinks;
 vector<hostlink> g_hostlinks;
+Trie g_routes;
 
-
+//
+// Function definitions
+//
 
 int main(int argc, char *argv[]) {
 	readConfig();
@@ -215,9 +234,9 @@ void readConfig() {
 				break;
 			case ROUTER_HOST_LINK:
 				hostlink hlink;
+				string prefix;
 				line >> hlink.routerId;
 				line >> hlink.routerSendDelay;
-				string prefix;
 				line >> prefix;
 				size_t slash = prefix.find_first_of("/");
 				hlink.overlayPrefix = strIPtoBin(prefix.substr(0, slash).c_str());
@@ -225,6 +244,9 @@ void readConfig() {
 				line >> hlink.endHostId;
 				line >> hlink.hostSendDelay;
 				g_hostlinks.push_back(hlink);
+				//add link to routing trie
+				bitset<32> overlayPrefixBits(ntohl(hlink.overlayPrefix));
+				g_routes.insertNode(overlayPrefixBits, hlink.significantBits, hlink.routerId);
 				break;
 		}
 		
