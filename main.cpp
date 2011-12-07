@@ -12,11 +12,12 @@ using namespace std;
 #define PACKET_LEN sizeof(struct iphdr) + sizeof(struct udphdr) + PAYLOAD_LEN
 
 void readArgs(int argc, char *argv[]);
-void readOverlayHeaders(u_int8_t *buffer, struct iphdr **iphPointer, struct udphdr **udphPointer);
+void readOverlayHeaders(u_int8_t *buffer, struct iphdr **iphPointer, struct udphdr **udphPointer, u_int8_t payload[PAYLOAD_LEN]);
 void createPacket(u_int8_t *buffer, u_int32_t destIP, u_int8_t *payload, int payloadLen);
 u_int32_t strIPtoBin(const char *strIP);
 void beAHost(void);
 void beARouter(void);
+void printPacket(u_int8_t packet[PACKET_LEN], int length);
 
 u_int8_t g_TTL = 3;
 u_int32_t g_IP = strIPtoBin("127.0.0.1");
@@ -31,21 +32,20 @@ int main(int argc, char *argv[]) {
 void readArgs(int argc, char *argv[]);
 
 //read the overlay headers into ip and udp struct, print out info from them
-void readOverlayHeaders(u_int8_t *buffer, struct iphdr **iphPointer, struct udphdr **udphPointer) {
+void readOverlayHeaders(u_int8_t *buffer, struct iphdr **iphPointer, struct udphdr **udphPointer, u_int8_t payload[PAYLOAD_LEN]) {
 	*iphPointer = (struct iphdr *)buffer;
 	struct iphdr *iph = *iphPointer;
 	
-	cout << "Source address: " << ntohl(iph->saddr) << endl
-	     << "Dest address: " << ntohl(iph->daddr) << endl;
-	
 	//check for UDP
 	if(iph->protocol == IPPROTO_UDP) {
-		*udphPointer = (udphdr *)(iph+(iph->ihl)*4);
+		*udphPointer = (udphdr *)(buffer+(iph->ihl)*4);
 		struct udphdr *udph = *udphPointer;
 		
 		cout << "Source port: " << ntohs(udph->source) << endl
 		     << "Dest port: " << ntohs(udph->dest) << endl
 			 << "Length: " << ntohs(udph->len) << endl;
+		//get payload
+		memcpy(payload, buffer+28, ntohs(udph->len)-8);
 	}
 }
 
@@ -55,17 +55,18 @@ void createPacket(u_int8_t *buffer, u_int32_t destIP, u_int8_t *payload, int pay
 	struct udphdr udph;
 	
 	bzero(&iph, sizeof(iph));
+	iph.version = 4;
 	iph.ihl = 5;
-	iph.tot_len = sizeof(iph) + sizeof(udph) + payloadLen;
+	iph.tot_len = htons(sizeof(iph) + sizeof(udph) + payloadLen);
 	iph.ttl = g_TTL;
 	iph.protocol = IPPROTO_UDP;
 	iph.saddr = g_IP;
-	iph.daddr = htonl(destIP);
+	iph.daddr = destIP;
 	
 	bzero(&udph, sizeof(udph));
 	udph.source = htons(MYPORT);
 	udph.dest = htons(MYPORT);
-	udph.len = sizeof(udph) + payloadLen;
+	udph.len = htons(sizeof(udph) + payloadLen);
 	
 	memcpy(buffer, &iph, sizeof(iph));
 	memcpy(buffer + sizeof(iph), &udph, sizeof(udph));
@@ -84,25 +85,37 @@ void beAHost(void) {
 	int sock;
 	
 	u_int8_t payload[PAYLOAD_LEN] = "Hello world!";
+	u_int8_t rxPayload[PAYLOAD_LEN] = "";
 	u_int8_t txBuffer[PACKET_LEN];
 	u_int8_t rxBuffer[PACKET_LEN] = "";
 	u_int32_t localhost = strIPtoBin("127.0.0.1");
 	int payloadLen = strlen((char *)payload);
+	int bytesSent;
+	int bytesReceived;
 	sock = create_cs3516_socket();
 	cout<<"Socket created."<<endl;
 	
 	createPacket(txBuffer, localhost, payload, payloadLen);
-	cs3516_send(sock, (char *)txBuffer, 28 + payloadLen, localhost);
-	cout<<"Message sent."<<endl;
+	printPacket(txBuffer, 28 + payloadLen);
+	bytesSent = cs3516_send(sock, (char *)txBuffer, 28 + payloadLen, localhost);
 	
-	cs3516_recv(sock, (char *)rxBuffer, PACKET_LEN);
+	bytesReceived = cs3516_recv(sock, (char *)rxBuffer, PACKET_LEN);
 	struct iphdr *iph;
 	struct udphdr *udph;
-	readOverlayHeaders(rxBuffer, &iph, &udph);
+	readOverlayHeaders(rxBuffer, &iph, &udph, rxPayload);
 	
 	cout<<"Message received."<<endl;
-	cout<<rxBuffer<<endl;
+	cout<<(char *)rxPayload<<endl;
 }
 
 void beARouter(void) {
+}
+
+void printPacket(u_int8_t packet[PACKET_LEN], int length) {
+	for(int i = 0; i < length; i++) {
+		printf("%02hX ", packet[i]);
+		if((i % 4) == 3) {
+			printf("\n");
+		}
+	}
 }
