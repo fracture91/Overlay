@@ -16,6 +16,7 @@
 #include <sstream>
 #include <cstdlib>
 #include <queue>
+#include <map>
 using namespace std;
 #include "cs3516sock.h"
 #include "trie.h"
@@ -116,7 +117,8 @@ void logPacket(struct iphdr *overlayIPHdr, logStatusCode code, u_int32_t nextHop
 
 fstream g_logfile;
 u_int8_t g_TTL = 3;
-u_int32_t g_IP = 0;  //network byte order
+u_int32_t g_overlayIP = 0; //network byte order
+u_int32_t g_realIP = 0;  //network byte order
 unsigned int g_queueLength = 0;
 int g_defaultTTL = 0;
 int g_thisID = 0;
@@ -236,7 +238,7 @@ bool isRouter(void) {
 			if((*routerIt).realIp == ip) {
 				g_thisID = (*routerIt).id;
 				g_isRouter = true;
-				g_IP = htonl(ip);
+				g_realIP = htonl(ip);
 				freeifaddrs(addressList);
 				return true;
 			}
@@ -245,7 +247,8 @@ bool isRouter(void) {
 			if((*hostIt).realIp == ip) {
 				g_thisID = (*hostIt).id;
 				g_isRouter = false;
-				g_IP = htonl(ip);
+				g_realIP = htonl(ip);
+				g_overlayIP = htonl((*hostIt).overlayIp);
 				freeifaddrs(addressList);
 				return false;
 			}
@@ -285,7 +288,7 @@ void createPacket(u_int8_t *buffer, u_int32_t destIP, u_int8_t *payload, int pay
 	iph.tot_len = htons(sizeof(iph) + sizeof(udph) + payloadLen);
 	iph.ttl = g_TTL;
 	iph.protocol = IPPROTO_UDP;
-	iph.saddr = g_IP;
+	iph.saddr = g_overlayIP;
 	iph.daddr = destIP;
 	
 	bzero(&udph, sizeof(udph));
@@ -376,7 +379,7 @@ void beAHost(void) {
 	u_int8_t txBuffer[PACKET_LEN];
 	u_int8_t rxBuffer[PACKET_LEN] = "";
 	u_int32_t router = strIPtoBin("192.168.0.8");
-	u_int32_t destination = strIPtoBin("192.168.0.10");
+	u_int32_t destination = g_overlayIP;
 	int payloadLen = strlen((char *)payload);
 	
 	g_sock = create_cs3516_socket(true);
@@ -455,14 +458,58 @@ int sendPacket(int destID, u_int8_t packetBuffer[PACKET_LEN], int packetLen) {
 	}
 }
 
+void getLinkQueues(map<int, queue<packet*> > &linkQueues) {
+	vector<hostlink>::iterator hlinkIt;
+	vector<routerlink>::iterator rlinkIt;
+
+	for(hlinkIt = g_hostlinks.begin(); hlinkIt < g_hostlinks.end(); hlinkIt++) {
+		if((*hlinkIt).routerId == g_thisID) {
+			int endhost = (*hlinkIt).endHostId;
+			if(linkQueues.find(endhost) == linkQueues.end()) {
+				linkQueues.insert(pair<int, queue<packet*> >(endhost, queue<packet*>()));
+			}
+		}
+	}
+	for(rlinkIt = g_routerlinks.begin(); rlinkIt < g_routerlinks.end(); rlinkIt++) {
+		bool related = false;
+		int other = 0;
+		if((*rlinkIt).router2Id == g_thisID) {
+			related = true;
+			other = (*rlinkIt).router1Id;
+		}
+		else if((*rlinkIt).router1Id == g_thisID) {
+			related = true;
+			other = (*rlinkIt).router2Id;
+		}
+		if(related) {
+			if(linkQueues.find(other) == linkQueues.end()) {
+				linkQueues.insert(pair<int, queue<packet*> >(other, queue<packet*>()));
+			}
+		}
+	}
+}
+
+//network byte order
+int IDfromOverlayIP(u_int32_t overlayIp) {
+	vector<endhost>::iterator hostIt;
+
+	for(hostIt = g_endhosts.begin(); hostIt < g_endhosts.end(); hostIt++) {
+		if((*hostIt).overlayIp == ntohl(overlayIp)) {
+			return (*hostIt).id;
+		}
+	}
+	return 0;
+}
+
 void beARouter(void) {
 	struct iphdr *iph;
 	struct udphdr *udph;
 	u_int32_t fwdAddr;
 	u_int8_t packetBuffer[PACKET_LEN] = "";
 	u_int8_t payload[PAYLOAD_LEN] = "";
-	packet *pkt;
-	queue<packet*> packetQ;
+	packet *pkt = NULL;
+	map<int, queue<packet*> > linkQueues;
+	map<int, queue<packet*> >::iterator mapIt;
 	int bytesReceived;
 	int packetSendResult;
 	cout<<"Being a router. Route route!"<<endl;
@@ -474,6 +521,8 @@ void beARouter(void) {
 	}
 	
 	g_sock = create_cs3516_socket(false);
+	
+	getLinkQueues(linkQueues);
 	
 	while(1) {
 		setBlocking(false);
@@ -489,34 +538,47 @@ void beARouter(void) {
 				continue;
 			}
 			
-			if(packetQ.size() >= g_queueLength) {
-				//drop packet
-				logPacket(iph, MAX_SENDQ_EXCEEDED);
-				continue;
-			}
+			int destID = 4; //todo:  actually route places
 			
-			//add packet to queue
-			pkt = (packet*)malloc(sizeof(packet));
-			memcpy(pkt->buffer, packetBuffer, PACKET_LEN);
-			pkt->length = bytesReceived;
-			packetQ.push(pkt);
+			if(linkQueues.find(destID) != linkQueues.end()) {
+				queue<packet*> & relevantQueue = linkQueues.find(destID)->second;
+				//todo: this will only work for host-router-host paths.
+				//		Make work for host-router...router-host. 
+				
+				if(relevantQueue.size() >= g_queueLength) {
+					//drop packet
+					logPacket(iph, MAX_SENDQ_EXCEEDED);
+					continue;
+				}
+				
+				//add packet to queue
+				pkt = (packet*)malloc(sizeof(packet));
+				memcpy(pkt->buffer, packetBuffer, PACKET_LEN);
+				pkt->length = bytesReceived;
+				relevantQueue.push(pkt);
+			}
 		}
 		
 		fwdAddr = strIPtoBin("192.168.0.10"); //todo
 		
-		//try to send a packet on the queue
-		if(packetQ.size() > 0) {
-			packetSendResult = sendPacket(4, packetQ.front()->buffer, packetQ.front()->length);
-			if(packetSendResult == 1) {
-				logPacket(iph, SENT_OKAY, fwdAddr);
-				packetQ.pop();
-			}
-			else if(packetSendResult == -1) {
-				logPacket(iph, NO_ROUTE_TO_HOST);
-				packetQ.pop();
-			}
-			else if(packetSendResult == 0) {
-				//delay has not passed - wait
+		for(mapIt = linkQueues.begin(); mapIt != linkQueues.end(); mapIt++) {
+			queue<packet*> & relevantQueue = (*mapIt).second;
+			//try to send a packet on the queue
+			if(relevantQueue.size() > 0) {
+				packetSendResult = sendPacket((*mapIt).first, relevantQueue.front()->buffer, relevantQueue.front()->length);
+				if(packetSendResult == 1) {
+					logPacket(iph, SENT_OKAY, fwdAddr);
+					free(relevantQueue.front());
+					relevantQueue.pop();
+				}
+				else if(packetSendResult == -1) {
+					logPacket(iph, NO_ROUTE_TO_HOST);
+					free(relevantQueue.front());
+					relevantQueue.pop();
+				}
+				else if(packetSendResult == 0) {
+					//delay has not passed - wait
+				}
 			}
 		}
 	}
