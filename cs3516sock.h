@@ -10,11 +10,11 @@
 // Set the following port to a unique number:
 #define MYPORT 4950
 
-int create_cs3516_socket() {
+int create_cs3516_socket(bool block) {
     int sock;
     struct sockaddr_in server;
     
-    sock = socket(AF_INET, SOCK_DGRAM, 0);
+    sock = socket(AF_INET, SOCK_DGRAM | (block ? 0 : SOCK_NONBLOCK), 0);
 
     if (sock < 0) error(-1, -1, "Error creating CS3516 socket");
 
