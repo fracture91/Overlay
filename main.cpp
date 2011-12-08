@@ -490,15 +490,33 @@ void getLinkQueues(map<int, queue<packet*> > &linkQueues) {
 }
 
 //network byte order
-int IDfromOverlayIP(u_int32_t overlayIp) {
+//return the id of the host with the given overlay IP, 0 if one doesn't exist
+int getHostIDfromOverlayIP(u_int32_t overlayIp) {
 	vector<endhost>::iterator hostIt;
-
+	
 	for(hostIt = g_endhosts.begin(); hostIt < g_endhosts.end(); hostIt++) {
 		if((*hostIt).overlayIp == ntohl(overlayIp)) {
 			return (*hostIt).id;
 		}
 	}
 	return 0;
+}
+
+//network byte order
+//returns the endhost id of the endhost linked directly to this router, if it exists
+//otherwise, returns next router id to send it to
+//returns -1 if it can't figure out where to send it
+int getNextIDfromOverlayIP(u_int32_t overlayIp) {
+	vector<hostlink>::iterator hlinkIt;
+	int hostId = getHostIDfromOverlayIP(overlayIp);
+	
+	for(hlinkIt = g_hostlinks.begin(); hlinkIt < g_hostlinks.end(); hlinkIt++) {
+		if((*hlinkIt).routerId == g_thisID && (*hlinkIt).endHostId == hostId) {
+			return (*hlinkIt).endHostId;
+		}
+	}
+	
+	return g_routes.getRouterID(ntohl(overlayIp));
 }
 
 void beARouter(void) {
@@ -512,6 +530,7 @@ void beARouter(void) {
 	map<int, queue<packet*> >::iterator mapIt;
 	int bytesReceived;
 	int packetSendResult;
+	int destID;
 	cout<<"Being a router. Route route!"<<endl;
 	
 	g_logfile.open("ROUTER_control.txt", fstream::out | fstream::app);
@@ -538,7 +557,7 @@ void beARouter(void) {
 				continue;
 			}
 			
-			int destID = 4; //todo:  actually route places
+			destID = getNextIDfromOverlayIP(iph->daddr);
 			
 			if(linkQueues.find(destID) != linkQueues.end()) {
 				queue<packet*> & relevantQueue = linkQueues.find(destID)->second;
@@ -559,7 +578,7 @@ void beARouter(void) {
 			}
 		}
 		
-		fwdAddr = strIPtoBin("192.168.0.10"); //todo
+		fwdAddr = realIPfromID(destID);
 		
 		for(mapIt = linkQueues.begin(); mapIt != linkQueues.end(); mapIt++) {
 			queue<packet*> & relevantQueue = (*mapIt).second;
