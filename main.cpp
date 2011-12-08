@@ -3,6 +3,8 @@
 #include <stdint.h>
 #include <netinet/ip.h>
 #include <netinet/udp.h>
+#include <netinet/in.h>
+#include <ifaddrs.h>
 
 #include <ctime>
 #include <iostream>
@@ -50,19 +52,21 @@ typedef enum {
 
 
 struct router {
-	int id;
-	u_int32_t realIp;
+	int id; //id of router
+	u_int32_t realIp; //real IP address of router (host byte order)
 };
 
 struct endhost {
-	int id;
-	u_int32_t realIp;
-	u_int32_t overlayIp;
+	int id; //id of end host
+	u_int32_t realIp; //real IP address of host (host byte order)
+	u_int32_t overlayIp; //overlay IP address of host (host byte order)
 };
 
 struct routerlink {
+	//router IDs of connected routers
 	int router1Id;
 	int router2Id;
+	//send delay times of connected routers
 	int router1SendDelay;
 	int router2SendDelay;
 };
@@ -70,8 +74,8 @@ struct routerlink {
 struct hostlink {
 	int routerId;
 	int routerSendDelay;
-	u_int32_t overlayPrefix;
-	int significantBits;
+	u_int32_t overlayPrefix; //overlay IP address prefix (host byte order)
+	int significantBits; //significant bits in the overlay IP address prefix
 	int endHostId;
 	int hostSendDelay;
 };
@@ -81,7 +85,7 @@ struct hostlink {
 //
 
 void readConfig();
-void readArgs(int argc, char *argv[]);
+bool isRouter(void);
 void readOverlayHeaders(u_int8_t *buffer, struct iphdr **iphPointer, struct udphdr **udphPointer, u_int8_t payload[PAYLOAD_LEN]);
 void createPacket(u_int8_t *buffer, u_int32_t destIP, u_int8_t *payload, int payloadLen);
 u_int32_t strIPtoBin(const char *strIP);
@@ -106,6 +110,7 @@ vector<endhost> g_endhosts;
 vector<routerlink> g_routerlinks;
 vector<hostlink> g_hostlinks;
 Trie g_routes;
+int g_sock;
 
 //
 // Function definitions
@@ -113,20 +118,116 @@ Trie g_routes;
 
 int main(int argc, char *argv[]) {
 	readConfig();
-	readArgs(argc, argv);
+	if(isRouter()) {
+		beARouter();
+	}
+	else {
+		beAHost();
+	}
 	return 0;
 }
 
-
-void readArgs(int argc, char *argv[]) {
-	if(argc > 1) {
-		if(!strcmp(argv[1], "host")) {
-			beAHost();
-		}
-		else if(!strcmp(argv[1], "router")) {
-			beARouter();
+void readConfig() {
+	fstream configfile;
+	configfile.open("config.txt", fstream::in);
+	if(!configfile.is_open()) {
+		cerr<<"Unable to open config file."<<endl;
+		return;
+	}
+	
+	while(configfile.good()) {
+		char temp[128];
+		configfile.getline(temp, 127);
+		istringstream line(temp);
+		int type;
+		string ip;
+		line >> type;
+		switch(type) {
+			case GLOBAL_CONFIG:
+				line >> g_queueLength;
+				line >> g_defaultTTL;
+				break;
+			case ROUTER_ID:
+				router r;
+				line >> r.id;
+				line >> ip;
+				r.realIp = ntohl(strIPtoBin(ip.c_str()));
+				g_routers.push_back(r);
+				break;
+			case HOST_ID:
+				endhost h;
+				line >> h.id;
+				line >> ip;
+				h.realIp = ntohl(strIPtoBin(ip.c_str()));
+				line >> ip;
+				h.overlayIp = ntohl(strIPtoBin(ip.c_str()));
+				g_endhosts.push_back(h);
+				break;
+			case ROUTER_ROUTER_LINK:
+				routerlink link;
+				line >> link.router1Id;
+				line >> link.router1SendDelay;
+				line >> link.router2Id;
+				line >> link.router2SendDelay;
+				g_routerlinks.push_back(link);
+				break;
+			case ROUTER_HOST_LINK:
+				hostlink hlink;
+				string prefix;
+				line >> hlink.routerId;
+				line >> hlink.routerSendDelay;
+				line >> prefix;
+				size_t slash = prefix.find_first_of("/");
+				hlink.overlayPrefix = ntohl(strIPtoBin(prefix.substr(0, slash).c_str()));
+				hlink.significantBits = atoi(prefix.substr(slash+1).c_str());
+				line >> hlink.endHostId;
+				line >> hlink.hostSendDelay;
+				g_hostlinks.push_back(hlink);
+				//add link to routing trie
+				bitset<32> overlayPrefixBits(hlink.overlayPrefix);
+				g_routes.insertNode(overlayPrefixBits, hlink.significantBits, hlink.routerId);
+				break;
 		}
 	}
+}
+
+bool isRouter(void) {
+	vector<router>::iterator routerIt;
+	vector<endhost>::iterator hostIt;
+	u_int32_t ip;
+	struct sockaddr_in *saddr;
+	struct ifaddrs *addressList;
+	struct ifaddrs *curAddr;
+	
+	//open socket
+	g_sock = create_cs3516_socket();
+	
+	//get IP addresses
+	getifaddrs(&addressList);
+	curAddr = addressList;
+	
+	while(curAddr != NULL) {
+		saddr = (struct sockaddr_in*)curAddr->ifa_addr;
+		ip = ntohl(saddr->sin_addr.s_addr);
+		//find the IP address in either the router list or host list
+		for(routerIt = g_routers.begin(); routerIt < g_routers.end(); routerIt++) {
+			if((*routerIt).realIp == ip) {
+				g_thisID = (*routerIt).id;
+				freeifaddrs(addressList);
+				return true;
+			}
+		}
+		for(hostIt = g_endhosts.begin(); hostIt < g_endhosts.end(); hostIt++) {
+			if((*hostIt).realIp == ip) {
+				g_thisID = (*hostIt).id;
+				freeifaddrs(addressList);
+				return false;
+			}
+		}
+		curAddr = curAddr->ifa_next;
+	}
+	cerr<<"Unable to find IP address in configuration file."<<endl;
+	throw(0);
 }
 
 //read the overlay headers into ip and udp struct, print out info from them
@@ -188,74 +289,7 @@ string binIPtoStr(u_int32_t naddr) {
 	return string(ipAddr);
 }
 
-void readConfig() {
-	fstream configfile;
-	configfile.open("config.txt", fstream::in);
-	if(!configfile.is_open()) {
-		cerr<<"Unable to open config file."<<endl;
-		return;
-	}
-	
-	while(configfile.good()) {
-		char temp[128];
-		configfile.getline(temp, 127);
-		istringstream line(temp);
-		int type;
-		string ip;
-		line >> type;
-		switch(type) {
-			case GLOBAL_CONFIG:
-				line >> g_queueLength;
-				line >> g_defaultTTL;
-				break;
-			case ROUTER_ID:
-				router r;
-				line >> r.id;
-				line >> ip;
-				r.realIp = strIPtoBin(ip.c_str());
-				g_routers.push_back(r);
-				break;
-			case HOST_ID:
-				endhost h;
-				line >> h.id;
-				line >> ip;
-				h.realIp = strIPtoBin(ip.c_str());
-				line >> ip;
-				h.overlayIp = strIPtoBin(ip.c_str());
-				g_endhosts.push_back(h);
-				break;
-			case ROUTER_ROUTER_LINK:
-				routerlink link;
-				line >> link.router1Id;
-				line >> link.router1SendDelay;
-				line >> link.router2Id;
-				line >> link.router2SendDelay;
-				g_routerlinks.push_back(link);
-				break;
-			case ROUTER_HOST_LINK:
-				hostlink hlink;
-				string prefix;
-				line >> hlink.routerId;
-				line >> hlink.routerSendDelay;
-				line >> prefix;
-				size_t slash = prefix.find_first_of("/");
-				hlink.overlayPrefix = strIPtoBin(prefix.substr(0, slash).c_str());
-				hlink.significantBits = atoi(prefix.substr(slash+1).c_str());
-				line >> hlink.endHostId;
-				line >> hlink.hostSendDelay;
-				g_hostlinks.push_back(hlink);
-				//add link to routing trie
-				bitset<32> overlayPrefixBits(ntohl(hlink.overlayPrefix));
-				g_routes.insertNode(overlayPrefixBits, hlink.significantBits, hlink.routerId);
-				break;
-		}
-		
-	}
-}
-
-void beAHost(void) {
-	int sock;
-	
+void beAHost(void) {	
 	u_int8_t payload[PAYLOAD_LEN] = "Hello world!";
 	u_int8_t rxPayload[PAYLOAD_LEN] = "";
 	u_int8_t txBuffer[PACKET_LEN];
@@ -265,14 +299,12 @@ void beAHost(void) {
 	int payloadLen = strlen((char *)payload);
 	int bytesSent;
 	int bytesReceived;
-	sock = create_cs3516_socket();
-	cout<<"Socket created."<<endl;
 	
 	createPacket(txBuffer, destination, payload, payloadLen);
 	printPacket(txBuffer, 28 + payloadLen);
-	bytesSent = cs3516_send(sock, (char *)txBuffer, 28 + payloadLen, router);
+	bytesSent = cs3516_send(g_sock, (char *)txBuffer, 28 + payloadLen, router);
 	
-	bytesReceived = cs3516_recv(sock, (char *)rxBuffer, PACKET_LEN);
+	bytesReceived = cs3516_recv(g_sock, (char *)rxBuffer, PACKET_LEN);
 	struct iphdr *iph;
 	struct udphdr *udph;
 	readOverlayHeaders(rxBuffer, &iph, &udph, rxPayload);
@@ -282,7 +314,6 @@ void beAHost(void) {
 }
 
 void beARouter(void) {
-	int sock;
 	struct iphdr *iph;
 	struct udphdr *udph;
 	u_int32_t fwdAddr;
@@ -291,8 +322,6 @@ void beARouter(void) {
 	int bytesReceived;
 	cout<<"Being a router. Route route!"<<endl;
 	
-	sock = create_cs3516_socket();
-	
 	g_logfile.open("ROUTER_control.txt", fstream::out | fstream::app);
 	if(!g_logfile.is_open()) {
 		cerr<<"Unable to open logfile."<<endl;
@@ -300,7 +329,7 @@ void beARouter(void) {
 	}
 	
 	while(1) {
-		bytesReceived = cs3516_recv(sock, (char *)packetBuffer, PACKET_LEN);
+		bytesReceived = cs3516_recv(g_sock, (char *)packetBuffer, PACKET_LEN);
 		readOverlayHeaders(packetBuffer, &iph, &udph, payload);
 		
 		//handle ttl
@@ -313,7 +342,7 @@ void beARouter(void) {
 		
 		//forward packet
 		fwdAddr = strIPtoBin("192.168.0.10");
-		cs3516_send(sock, (char *)packetBuffer, bytesReceived, fwdAddr);
+		cs3516_send(g_sock, (char *)packetBuffer, bytesReceived, fwdAddr);
 		logPacket(iph, SENT_OKAY, fwdAddr);
 	}
 }
