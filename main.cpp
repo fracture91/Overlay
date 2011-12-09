@@ -29,7 +29,7 @@ using namespace std;
 #define HEADERS_LEN (sizeof(struct iphdr) + sizeof(struct udphdr))
 #define PACKET_LEN (HEADERS_LEN + PAYLOAD_LEN)
 
-#define DEBUG 1
+#define DEBUG 0
 
 #if DEBUG
 #define DEBUGF(format, ...) printf(format, ##__VA_ARGS__)
@@ -107,7 +107,7 @@ struct packet {
 void readConfig();
 bool isRouter(void);
 void readOverlayHeaders(u_int8_t *buffer, struct iphdr **iphPointer, struct udphdr **udphPointer, u_int8_t payload[PAYLOAD_LEN]);
-void createPacket(u_int8_t *buffer, u_int32_t destIP, u_int8_t *payload, int payloadLen, u_int16_t sport, u_int16_t dport);
+void createPacket(u_int8_t *buffer, u_int32_t destIP, u_int8_t *payload, int payloadLen, u_int16_t sport, u_int16_t dport, u_int16_t seq);
 int timeval_subtract(struct timeval *result, struct timeval tv1, struct timeval tv0);
 void msToTimeval(long int ms, struct timeval *result);
 u_int32_t strIPtoBin(const char *strIP);
@@ -118,7 +118,7 @@ void beAHost(void);
 void hostTryToReceive(void);
 int hostRecvPacket(struct packet* toRecv);
 void hostTryToSend(void);
-int hostSendPacket(u_int8_t payload[PAYLOAD_LEN], int payloadLen, u_int32_t destAddr, u_int16_t sourcePort, u_int16_t destPort);
+int hostSendPacket(u_int8_t payload[PAYLOAD_LEN], int payloadLen, u_int32_t destAddr, u_int16_t sourcePort, u_int16_t destPort, u_int16_t seq);
 void setBlocking(bool block);
 int sendPacket(int destID, u_int8_t packetBuffer[PACKET_LEN], int packetLen);
 void beARouter(void);
@@ -286,17 +286,14 @@ void readOverlayHeaders(u_int8_t *buffer, struct iphdr **iphPointer, struct udph
 		struct udphdr *udph = *udphPointer;
 		
 		DEBUGF("Source addr: %s\nDest addr: %s\n", binIPtoStr(iph->saddr).c_str(), binIPtoStr(iph->daddr).c_str());
-		
-		cout << "Source port: " << ntohs(udph->source) << endl
-		     << "Dest port: " << ntohs(udph->dest) << endl
-			 << "Length: " << ntohs(udph->len) << endl;
+		DEBUGF("Source port: %hu\nDest port: %hu\nLength: %hu\n", ntohs(udph->source), ntohs(udph->dest), ntohs(udph->len)-8);
 		//get payload
 		memcpy(payload, buffer+HEADERS_LEN, ntohs(udph->len)-8);
 	}
 }
 
 //fills in the given buffer with overlay headers and data
-void createPacket(u_int8_t *buffer, u_int32_t destIP, u_int8_t *payload, int payloadLen, u_int16_t sport, u_int16_t dport) {
+void createPacket(u_int8_t *buffer, u_int32_t destIP, u_int8_t *payload, int payloadLen, u_int16_t sport, u_int16_t dport, u_int16_t seq) {
 	struct iphdr iph;
 	struct udphdr udph;
 	
@@ -304,6 +301,7 @@ void createPacket(u_int8_t *buffer, u_int32_t destIP, u_int8_t *payload, int pay
 	iph.version = 4;
 	iph.ihl = 5;
 	iph.tot_len = htons(sizeof(iph) + sizeof(udph) + payloadLen);
+	iph.id = seq;
 	iph.ttl = g_TTL;
 	iph.protocol = IPPROTO_UDP;
 	iph.saddr = g_overlayIP;
@@ -414,7 +412,8 @@ u_int32_t getLinkedRouter(struct hostlink **retLink) {
 	return 0;
 }
 
-void beAHost(void) {	
+void beAHost(void) {
+	DEBUGF("Being a host. Mmm, hosty!\n");
 	g_sock = create_cs3516_socket(false);
 	
 	//get information on router linked to this host-router
@@ -440,6 +439,9 @@ void hostTryToReceive(void) {
 	struct udphdr *udph;
 	int rcvStatus;
 	int payloadLen;
+	static int totalSize = 0;
+	static u_int16_t lastSeqReceived = 0;
+	static int packetCount = 0;
 	
 	if(!outFile.is_open()) {
 		cerr<<"Unable to open output file."<<endl;
@@ -452,12 +454,26 @@ void hostTryToReceive(void) {
 		memset(payload, 0, PAYLOAD_LEN);
 		readOverlayHeaders(toRecv.buffer, &iph, &udph, payload);
 		payloadLen = toRecv.length - HEADERS_LEN;
+		if(ntohs(iph->id) > lastSeqReceived + 1) {
+			for(u_int16_t missingIdx = lastSeqReceived+1; missingIdx < ntohs(iph->id); missingIdx++) {
+				cout<<"Missing packet ID: "<<missingIdx<<endl;
+			}
+		}
+		lastSeqReceived = ntohs(iph->id);
 		outFile <<"Source address: "<<binIPtoStr(iph->saddr)<<endl
 				<<"Destination address: "<<binIPtoStr(iph->daddr)<<endl
 				<<"Source port: "<<ntohs(udph->source)<<endl
 				<<"Destination port: "<<ntohs(udph->dest)<<endl;
 		outFile.write((char*)payload, payloadLen);
 		outFile<<endl<<endl;
+		totalSize += payloadLen;
+		packetCount++;
+		//end of file - will fail if last payloadLen is exactly PAYLOAD_LEN (file is multiple of PAYLOAD_LEN)
+		if(payloadLen < PAYLOAD_LEN) {
+			cout<<"File received:"<<endl
+				<<"Length: "<<totalSize<<endl
+				<<"Packets received: "<<packetCount<<endl;
+		}
 	}
 }
 
@@ -485,13 +501,16 @@ void hostTryToSend(void) {
 		STATE_FOUNDFILE,
 		STATE_SENDPACKET,
 		STATE_TRYAGAIN,
-		STATE_FINISHED
+		STATE_FINISHED,
+		STATE_IDLE
 	} state = STATE_LOOKFORFILE;
 	static fstream sendFile;
 	static u_int32_t destIP;
 	static u_int16_t srcPort, destPort;
 	static u_int8_t buffer[PAYLOAD_LEN] = "";
 	static int bufLen;
+	static u_int16_t sequence = 0; //host byte order
+	static int totalBytes = 0;
 	char tempDestIP[32] = "";
 	int sendResult;
 	
@@ -518,9 +537,13 @@ void hostTryToSend(void) {
 				
 				sendFile.read((char*)buffer, PAYLOAD_LEN);
 				bufLen = sendFile.gcount();
-				sendResult = hostSendPacket(buffer, bufLen, destIP, srcPort, destPort);
+				sendResult = hostSendPacket(buffer, bufLen, destIP, srcPort, destPort, htons(sequence));
 				if(sendResult == 0) {
 					state = STATE_TRYAGAIN;
+				}
+				else {
+					totalBytes += bufLen;
+					sequence++;
 				}
 			}
 			else {
@@ -528,12 +551,20 @@ void hostTryToSend(void) {
 			}
 			break;
 		case STATE_TRYAGAIN:
-			sendResult = hostSendPacket(buffer, bufLen, destIP, srcPort, destPort);
+			sendResult = hostSendPacket(buffer, bufLen, destIP, srcPort, destPort, htons(sequence));
 			if(sendResult == 1) {
+				sequence++;
+				totalBytes += bufLen;
 				state = STATE_SENDPACKET;
 			}
 			break;
 		case STATE_FINISHED:
+			cout<<"File transmitted."<<endl
+				<<"Size: "<<totalBytes<<" bytes."<<endl
+				<<"Packets trasmitted: "<<sequence<<endl;
+			state = STATE_IDLE;
+			break;
+		case STATE_IDLE:
 			break;
 	}
 }
@@ -543,7 +574,8 @@ void hostTryToSend(void) {
 int hostSendPacket(u_int8_t payload[PAYLOAD_LEN], int payloadLen,
 					u_int32_t destAddr, //network order
 					u_int16_t sourcePort, //network order
-					u_int16_t destPort) { //network order
+					u_int16_t destPort, //network order
+					u_int16_t seq) { //network order
 	
 	u_int8_t packetBuffer[PACKET_LEN];
 	int packetLen = HEADERS_LEN + payloadLen;
@@ -555,7 +587,7 @@ int hostSendPacket(u_int8_t payload[PAYLOAD_LEN], int payloadLen,
 	timeval_subtract(&difTime, curTime, g_defaultHostLink->lastSendTime);
 	if(timeval_subtract(NULL, difTime, g_defaultHostLink->hostSendDelay) == 1) {
 		//send the packet
-		createPacket(packetBuffer, destAddr, payload, payloadLen, sourcePort, destPort);
+		createPacket(packetBuffer, destAddr, payload, payloadLen, sourcePort, destPort, seq);
 		cs3516_send(g_sock, (char *)packetBuffer, packetLen, htonl(g_defaultRouterIp));
 		g_defaultHostLink->lastSendTime = curTime;
 		return 1;
@@ -701,7 +733,7 @@ void beARouter(void) {
 	int bytesReceived;
 	int packetSendResult;
 	int destID;
-	cout<<"Being a router. Route route!"<<endl;
+	DEBUGF("Being a router. Route route!\n");
 	
 	g_logfile.open("ROUTER_control.txt", fstream::out | fstream::app);
 	if(!g_logfile.is_open()) {
