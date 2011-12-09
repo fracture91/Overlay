@@ -26,7 +26,16 @@ using namespace std;
 //
 
 #define PAYLOAD_LEN 1000
-#define PACKET_LEN sizeof(struct iphdr) + sizeof(struct udphdr) + PAYLOAD_LEN
+#define HEADERS_LEN (sizeof(struct iphdr) + sizeof(struct udphdr))
+#define PACKET_LEN (HEADERS_LEN + PAYLOAD_LEN)
+
+#define DEBUG 1
+
+#if DEBUG
+#define DEBUGF(format, ...) printf(format, ##__VA_ARGS__)
+#else
+#define DEBUGF(format, ...)
+#endif
 
 //
 // Types
@@ -98,13 +107,18 @@ struct packet {
 void readConfig();
 bool isRouter(void);
 void readOverlayHeaders(u_int8_t *buffer, struct iphdr **iphPointer, struct udphdr **udphPointer, u_int8_t payload[PAYLOAD_LEN]);
-void createPacket(u_int8_t *buffer, u_int32_t destIP, u_int8_t *payload, int payloadLen);
+void createPacket(u_int8_t *buffer, u_int32_t destIP, u_int8_t *payload, int payloadLen, u_int16_t sport, u_int16_t dport);
 int timeval_subtract(struct timeval *result, struct timeval tv1, struct timeval tv0);
 void msToTimeval(long int ms, struct timeval *result);
 u_int32_t strIPtoBin(const char *strIP);
 string binIPtoStr(u_int32_t naddr);
 u_int32_t realIPfromID(int id);
+u_int32_t getLinkedRouter(struct hostlink **retLink);
 void beAHost(void);
+void hostTryToReceive(void);
+int hostRecvPacket(struct packet* toRecv);
+void hostTryToSend(void);
+int hostSendPacket(u_int8_t payload[PAYLOAD_LEN], int payloadLen, u_int32_t destAddr, u_int16_t sourcePort, u_int16_t destPort);
 void setBlocking(bool block);
 int sendPacket(int destID, u_int8_t packetBuffer[PACKET_LEN], int packetLen);
 void beARouter(void);
@@ -119,6 +133,8 @@ fstream g_logfile;
 u_int8_t g_TTL = 3;
 u_int32_t g_overlayIP = 0; //network byte order
 u_int32_t g_realIP = 0;  //network byte order
+u_int32_t g_defaultRouterIp = 0;  //IP of default router the host sends to
+struct hostlink *g_defaultHostLink = NULL;  //hostlink to default router
 unsigned int g_queueLength = 0;
 int g_defaultTTL = 0;
 int g_thisID = 0;
@@ -183,16 +199,16 @@ void readConfig() {
 				g_endhosts.push_back(h);
 				break;
 			case ROUTER_ROUTER_LINK:
-				routerlink link;
-				line >> link.router1Id;
+				routerlink rlink;
+				line >> rlink.router1Id;
 				line >> tempDelayTime;
-				msToTimeval(tempDelayTime, &(link.router1SendDelay));
-				line >> link.router2Id;
+				msToTimeval(tempDelayTime, &(rlink.router1SendDelay));
+				line >> rlink.router2Id;
 				line >> tempDelayTime;
-				msToTimeval(tempDelayTime, &(link.router2SendDelay));
-				g_routerlinks.push_back(link);
-				link.lastSendTime.tv_sec = 0;
-				link.lastSendTime.tv_usec = 0;
+				msToTimeval(tempDelayTime, &(rlink.router2SendDelay));
+				g_routerlinks.push_back(rlink);
+				rlink.lastSendTime.tv_sec = 0;
+				rlink.lastSendTime.tv_usec = 0;
 				break;
 			case ROUTER_HOST_LINK:
 				hostlink hlink;
@@ -269,16 +285,18 @@ void readOverlayHeaders(u_int8_t *buffer, struct iphdr **iphPointer, struct udph
 		*udphPointer = (udphdr *)(buffer+(iph->ihl)*4);
 		struct udphdr *udph = *udphPointer;
 		
+		DEBUGF("Source addr: %s\nDest addr: %s\n", binIPtoStr(iph->saddr).c_str(), binIPtoStr(iph->daddr).c_str());
+		
 		cout << "Source port: " << ntohs(udph->source) << endl
 		     << "Dest port: " << ntohs(udph->dest) << endl
 			 << "Length: " << ntohs(udph->len) << endl;
 		//get payload
-		memcpy(payload, buffer+28, ntohs(udph->len)-8);
+		memcpy(payload, buffer+HEADERS_LEN, ntohs(udph->len)-8);
 	}
 }
 
 //fills in the given buffer with overlay headers and data
-void createPacket(u_int8_t *buffer, u_int32_t destIP, u_int8_t *payload, int payloadLen) {
+void createPacket(u_int8_t *buffer, u_int32_t destIP, u_int8_t *payload, int payloadLen, u_int16_t sport, u_int16_t dport) {
 	struct iphdr iph;
 	struct udphdr udph;
 	
@@ -292,8 +310,8 @@ void createPacket(u_int8_t *buffer, u_int32_t destIP, u_int8_t *payload, int pay
 	iph.daddr = destIP;
 	
 	bzero(&udph, sizeof(udph));
-	udph.source = htons(MYPORT);
-	udph.dest = htons(MYPORT);
+	udph.source = sport;
+	udph.dest = dport;
 	udph.len = htons(sizeof(udph) + payloadLen);
 	
 	memcpy(buffer, &iph, sizeof(iph));
@@ -373,29 +391,180 @@ u_int32_t realIPfromID(int id) {
 	return 0;
 }
 
+//returns router IP address of router linked to this host (host byte order)
+//retLink assigned to the hostlink involving this host
+u_int32_t getLinkedRouter(struct hostlink **retLink) {
+	vector<hostlink>::iterator hlinkIt;
+	vector<router>::iterator routerIt;
+	bool routerFound = false;
+	for(hlinkIt = g_hostlinks.begin(); hlinkIt < g_hostlinks.end(); hlinkIt++) {
+		if((*hlinkIt).endHostId == g_thisID) {
+			*retLink = &(*hlinkIt);
+			routerFound = true;
+			break;
+		}
+	}
+	if(routerFound) {
+		for(routerIt = g_routers.begin(); routerIt < g_routers.end(); routerIt++) {
+			if((*routerIt).id == (*retLink)->routerId) {
+				return (*routerIt).realIp;
+			}
+		}
+	}
+	return 0;
+}
+
 void beAHost(void) {	
-	u_int8_t payload[PAYLOAD_LEN] = "Hello world!";
-	u_int8_t rxPayload[PAYLOAD_LEN] = "";
-	u_int8_t txBuffer[PACKET_LEN];
-	u_int8_t rxBuffer[PACKET_LEN] = "";
-	u_int32_t router = strIPtoBin("192.168.0.8");
-	u_int32_t destination = g_overlayIP;
-	int payloadLen = strlen((char *)payload);
+	g_sock = create_cs3516_socket(false);
 	
-	g_sock = create_cs3516_socket(true);
+	//get information on router linked to this host-router
+	g_defaultRouterIp = getLinkedRouter(&g_defaultHostLink);
+	if(g_defaultRouterIp == 0 || g_defaultHostLink == NULL) {
+		cerr << "Host has no link to a router" << endl;
+		throw(0);
+	}
 	
-	createPacket(txBuffer, destination, payload, payloadLen);
-	printPacket(txBuffer, 28 + payloadLen);
-	cs3516_send(g_sock, (char *)txBuffer, 28 + payloadLen, router);
-	
-	cs3516_recv(g_sock, (char *)rxBuffer, PACKET_LEN);
+	setBlocking(false);
+	while(1) {
+		hostTryToReceive();		
+		hostTryToSend();
+	}
+}
+
+//When called in a loop, implements end-host receive file functionality
+void hostTryToReceive(void) {
+	static fstream outFile("recv.txt", fstream::out | fstream::app);
+	static struct packet toRecv;
+	static u_int8_t payload[PAYLOAD_LEN];
 	struct iphdr *iph;
 	struct udphdr *udph;
-	readOverlayHeaders(rxBuffer, &iph, &udph, rxPayload);
+	int rcvStatus;
+	int payloadLen;
 	
-	cout<<"Message received."<<endl;
-	cout<<(char *)rxPayload<<endl;
+	if(!outFile.is_open()) {
+		cerr<<"Unable to open output file."<<endl;
+		throw(0);
+	}
+	
+	memset(toRecv.buffer, 0, PACKET_LEN);
+	rcvStatus = hostRecvPacket(&toRecv);
+	if(rcvStatus == 1) {
+		memset(payload, 0, PAYLOAD_LEN);
+		readOverlayHeaders(toRecv.buffer, &iph, &udph, payload);
+		payloadLen = toRecv.length - HEADERS_LEN;
+		outFile <<"Source address: "<<binIPtoStr(iph->saddr)<<endl
+				<<"Destination address: "<<binIPtoStr(iph->daddr)<<endl
+				<<"Source port: "<<ntohs(udph->source)<<endl
+				<<"Destination port: "<<ntohs(udph->dest)<<endl;
+		outFile.write((char*)payload, payloadLen);
+		outFile<<endl<<endl;
+	}
 }
+
+//receive a packet
+//returns -1 on error, 1 on successful receive, and 0 if nothing to receive
+int hostRecvPacket(struct packet* toRecv) {
+	u_int8_t rxBuffer[PACKET_LEN];
+	int bytesReceived;
+	
+	bytesReceived = cs3516_recv(g_sock, (char *)rxBuffer, PACKET_LEN);
+	if(bytesReceived > 0) {
+		memcpy(toRecv->buffer, rxBuffer, bytesReceived);
+		toRecv->length = bytesReceived;
+		return 1;
+	}
+	else {
+		return 0;
+	}
+}
+
+//When called in a loop, implements end-host send file functionality
+void hostTryToSend(void) {
+	static enum {
+		STATE_LOOKFORFILE,
+		STATE_FOUNDFILE,
+		STATE_SENDPACKET,
+		STATE_TRYAGAIN,
+		STATE_FINISHED
+	} state = STATE_LOOKFORFILE;
+	static fstream sendFile;
+	static u_int32_t destIP;
+	static u_int16_t srcPort, destPort;
+	static u_int8_t buffer[PAYLOAD_LEN] = "";
+	static int bufLen;
+	char tempDestIP[32] = "";
+	int sendResult;
+	
+	switch(state) {
+		case STATE_LOOKFORFILE:
+			sendFile.open("send.txt", fstream::in);
+			if(sendFile.is_open()) {
+				state = STATE_FOUNDFILE;
+			}
+			else {
+				break;
+			}
+		case STATE_FOUNDFILE:
+			sendFile.getline((char*)buffer, PAYLOAD_LEN-1);
+			sscanf((char*)buffer, "%s %hu %hu", tempDestIP, &srcPort, &destPort);
+			destIP = strIPtoBin(tempDestIP);
+			srcPort = htons(srcPort);
+			destPort = htons(destPort);
+			state = STATE_SENDPACKET;
+		case STATE_SENDPACKET:
+			if(sendFile.good()) {
+				bufLen = 0;
+				memset(buffer, 0, PAYLOAD_LEN);
+				
+				sendFile.read((char*)buffer, PAYLOAD_LEN);
+				bufLen = sendFile.gcount();
+				sendResult = hostSendPacket(buffer, bufLen, destIP, srcPort, destPort);
+				if(sendResult == 0) {
+					state = STATE_TRYAGAIN;
+				}
+			}
+			else {
+				state = STATE_FINISHED;
+			}
+			break;
+		case STATE_TRYAGAIN:
+			sendResult = hostSendPacket(buffer, bufLen, destIP, srcPort, destPort);
+			if(sendResult == 1) {
+				state = STATE_SENDPACKET;
+			}
+			break;
+		case STATE_FINISHED:
+			break;
+	}
+}
+
+//send a packet
+//returns -1 on error, 1 on successful send, and 0 if delay time has not happened yet
+int hostSendPacket(u_int8_t payload[PAYLOAD_LEN], int payloadLen,
+					u_int32_t destAddr, //network order
+					u_int16_t sourcePort, //network order
+					u_int16_t destPort) { //network order
+	
+	u_int8_t packetBuffer[PACKET_LEN];
+	int packetLen = HEADERS_LEN + payloadLen;
+	struct timeval difTime;
+	struct timeval curTime;
+	
+	//check delay
+	gettimeofday(&curTime, NULL);
+	timeval_subtract(&difTime, curTime, g_defaultHostLink->lastSendTime);
+	if(timeval_subtract(NULL, difTime, g_defaultHostLink->hostSendDelay) == 1) {
+		//send the packet
+		createPacket(packetBuffer, destAddr, payload, payloadLen, sourcePort, destPort);
+		cs3516_send(g_sock, (char *)packetBuffer, packetLen, htonl(g_defaultRouterIp));
+		g_defaultHostLink->lastSendTime = curTime;
+		return 1;
+	}
+	else {
+		return 0;
+	}
+}
+
 
 void setBlocking(bool block) {
 	int flags = fcntl(g_sock, F_GETFL);
@@ -416,51 +585,49 @@ int sendPacket(int destID, u_int8_t packetBuffer[PACKET_LEN], int packetLen) {
 	struct timeval *lastTime;
 	struct timeval delayTime;
 	
-	if(g_isRouter) {
-		//find applicable link
-		for(hlinkIt = g_hostlinks.begin(); hlinkIt < g_hostlinks.end(); hlinkIt++) {
-			if((*hlinkIt).endHostId == destID && (*hlinkIt).routerId == g_thisID) {
-				destAddr = realIPfromID(destID);
-				lastTime = &((*hlinkIt).lastSendTime);
-				delayTime = (*hlinkIt).routerSendDelay;
-			}
-		}
-		for(rlinkIt = g_routerlinks.begin(); rlinkIt < g_routerlinks.end(); rlinkIt++) {
-			if((*rlinkIt).router1Id == destID && (*rlinkIt).router2Id == g_thisID) {
-				destAddr = realIPfromID(destID);
-				lastTime = &((*rlinkIt).lastSendTime);
-				delayTime = (*rlinkIt).router2SendDelay;
-			}
-			else if((*rlinkIt).router2Id == destID && (*rlinkIt).router1Id == g_thisID) {
-				destAddr = realIPfromID(destID);
-				lastTime = &((*rlinkIt).lastSendTime);
-				delayTime = (*rlinkIt).router1SendDelay;
-			}
-		}
-		if(destAddr == 0) {
-			return -1;
-		}
-		gettimeofday(&curTime, NULL);
-		timeval_subtract(&difTime, curTime, *lastTime);
-		if(timeval_subtract(NULL, delayTime, difTime) == 1) {
-			return 0;
-		}
-		else {
-			//need to make the socket blocking again so it's guaranteed to send when called
-			setBlocking(true);
-			cs3516_send(g_sock, (char *)packetBuffer, packetLen, destAddr);
-			gettimeofday(lastTime, NULL);
-			return 1;
+	//find applicable link
+	for(hlinkIt = g_hostlinks.begin(); hlinkIt < g_hostlinks.end(); hlinkIt++) {
+		if((*hlinkIt).endHostId == destID && (*hlinkIt).routerId == g_thisID) {
+			destAddr = realIPfromID(destID);
+			lastTime = &((*hlinkIt).lastSendTime);
+			delayTime = (*hlinkIt).routerSendDelay;
 		}
 	}
+	for(rlinkIt = g_routerlinks.begin(); rlinkIt < g_routerlinks.end(); rlinkIt++) {
+		if((*rlinkIt).router1Id == destID && (*rlinkIt).router2Id == g_thisID) {
+			destAddr = realIPfromID(destID);
+			lastTime = &((*rlinkIt).lastSendTime);
+			delayTime = (*rlinkIt).router2SendDelay;
+		}
+		else if((*rlinkIt).router2Id == destID && (*rlinkIt).router1Id == g_thisID) {
+			destAddr = realIPfromID(destID);
+			lastTime = &((*rlinkIt).lastSendTime);
+			delayTime = (*rlinkIt).router1SendDelay;
+		}
+	}
+	if(destAddr == 0) {
+		DEBUGF("Unable to find destination address for destID %d\n", destID);
+		return -1;
+	}
+	gettimeofday(&curTime, NULL);
+	timeval_subtract(&difTime, curTime, *lastTime);
+	if(timeval_subtract(NULL, delayTime, difTime) == 1) {
+		return 0;
+	}
 	else {
-		return 7;
+		//need to make the socket blocking again so it's guaranteed to send when called
+		setBlocking(true);
+		cs3516_send(g_sock, (char *)packetBuffer, packetLen, destAddr);
+		gettimeofday(lastTime, NULL);
+		return 1;
 	}
 }
 
 void getLinkQueues(map<int, queue<packet*> > &linkQueues) {
 	vector<hostlink>::iterator hlinkIt;
 	vector<routerlink>::iterator rlinkIt;
+	
+	DEBUGF("Populating link queues...\n");
 
 	for(hlinkIt = g_hostlinks.begin(); hlinkIt < g_hostlinks.end(); hlinkIt++) {
 		if((*hlinkIt).routerId == g_thisID) {
@@ -473,6 +640,7 @@ void getLinkQueues(map<int, queue<packet*> > &linkQueues) {
 	for(rlinkIt = g_routerlinks.begin(); rlinkIt < g_routerlinks.end(); rlinkIt++) {
 		bool related = false;
 		int other = 0;
+		DEBUGF("Current link: router1Id: %d router2Id: %d thisID: %d\n", (*rlinkIt).router1Id, (*rlinkIt).router2Id, g_thisID);
 		if((*rlinkIt).router2Id == g_thisID) {
 			related = true;
 			other = (*rlinkIt).router1Id;
@@ -482,7 +650,9 @@ void getLinkQueues(map<int, queue<packet*> > &linkQueues) {
 			other = (*rlinkIt).router2Id;
 		}
 		if(related) {
+			DEBUGF("Link is related.\n");
 			if(linkQueues.find(other) == linkQueues.end()) {
+				DEBUGF("Link queue inserted.\n");
 				linkQueues.insert(pair<int, queue<packet*> >(other, queue<packet*>()));
 			}
 		}
@@ -552,12 +722,14 @@ void beARouter(void) {
 			//handle ttl
 			iph->ttl-=1;
 			if(iph->ttl <= 0) {
+				DEBUGF("Dropping packet: TTL Expired.\n");
 				//drop packet
 				logPacket(iph, TTL_EXPIRED);
 				continue;
 			}
 			
 			destID = getNextIDfromOverlayIP(iph->daddr);
+			DEBUGF("destID is %d\n", destID);
 			
 			if(linkQueues.find(destID) != linkQueues.end()) {
 				queue<packet*> & relevantQueue = linkQueues.find(destID)->second;
@@ -576,6 +748,10 @@ void beARouter(void) {
 				pkt->length = bytesReceived;
 				relevantQueue.push(pkt);
 			}
+			else {
+				DEBUGF("Unable to find queue to add packet to.\n");
+				logPacket(iph, NO_ROUTE_TO_HOST);
+			}
 		}
 		
 		fwdAddr = realIPfromID(destID);
@@ -586,6 +762,7 @@ void beARouter(void) {
 			if(relevantQueue.size() > 0) {
 				packetSendResult = sendPacket((*mapIt).first, relevantQueue.front()->buffer, relevantQueue.front()->length);
 				if(packetSendResult == 1) {
+					DEBUGF("Packet sent.\n");
 					logPacket(iph, SENT_OKAY, fwdAddr);
 					free(relevantQueue.front());
 					relevantQueue.pop();

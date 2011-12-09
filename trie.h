@@ -23,7 +23,7 @@ class Trie {
 			free(children);
 		}
 		//note: bits needs to be in host byte order
-		void insertNode(bitset<BITCOUNT> &bits, int sigBits, int newDestRouterID, int curBit = 0) {
+		void insertNode(bitset<BITCOUNT> &bits, int sigBits, int newDestRouterID, int curBit = 1) {
 			if(curBit > sigBits || curBit < 0 || sigBits >= BITCOUNT || sigBits < 1) {
 				//error
 				return;
@@ -43,7 +43,7 @@ class Trie {
 			}
 		}
 		//note: overlayIP needs to be in host byte order
-		int getRouterID(u_int32_t overlayIP, int curBit = 0) {
+		int getRouterID(u_int32_t overlayIP, int curBit = 1) {
 			int thisBit;
 			int tempDestID;
 			if(curBit == BITCOUNT) {
